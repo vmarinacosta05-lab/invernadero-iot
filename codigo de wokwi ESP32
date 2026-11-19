@@ -1,0 +1,126 @@
+#include <WiFi.h>
+#include <PubSubClient.h>
+#include <DHT.h>
+
+// ---------- Pines ----------
+#define PIN_DHT   15
+#define PIN_SUELO 34
+#define PIN_LED   26
+#define TIPO_DHT  DHT22
+
+// ---------- WiFi (red simulada de Wokwi) ----------
+const char* WIFI_SSID = "Wokwi-GUEST";
+const char* WIFI_PASS = "";
+
+// ---------- MQTT (ThingsBoard) ----------
+const char* MQTT_SERVER = "mqtt.thingsboard.cloud";   // EU: mqtt.eu.thingsboard.cloud
+const int   MQTT_PORT   = 1883;
+const char* TOKEN       = " ";
+
+const char* TOPIC_TELEMETRIA = "v1/devices/me/telemetry";
+const char* TOPIC_RPC        = "v1/devices/me/rpc/request/+";
+
+DHT dht(PIN_DHT, TIPO_DHT);
+WiFiClient espClient;
+PubSubClient client(espClient);
+
+const unsigned long INTERVALO = 2000;  // publica cada 2 segundos
+unsigned long ultimaLectura = 0;
+bool bombaEncendida = false;
+
+// Se ejecuta cuando ThingsBoard envía un comando (RPC)
+void callback(char* topic, byte* payload, unsigned int length) {
+  String mensaje = "";
+  for (unsigned int i = 0; i < length; i++) {
+    mensaje += (char)payload[i];
+  }
+  Serial.print("Comando recibido: ");
+  Serial.println(mensaje);
+
+  // El id de la petición va al final del tópico
+  String topico = String(topic);
+  String idPeticion = topico.substring(topico.lastIndexOf('/') + 1);
+
+  if (mensaje.indexOf("setValue") >= 0 || mensaje.indexOf("setPump") >= 0) {
+    // params puede ser true o false
+    if (mensaje.indexOf("true") >= 0) {
+      bombaEncendida = true;
+    } else if (mensaje.indexOf("false") >= 0) {
+      bombaEncendida = false;
+    }
+    digitalWrite(PIN_LED, bombaEncendida ? HIGH : LOW);
+    Serial.println(bombaEncendida ? "Bomba de riego ENCENDIDA" : "Bomba de riego APAGADA");
+  }
+
+  // Responde con el estado actual (ThingsBoard lo usa para actualizar el switch)
+  String topicoRespuesta = "v1/devices/me/rpc/response/" + idPeticion;
+  client.publish(topicoRespuesta.c_str(), bombaEncendida ? "true" : "false");
+}
+
+void conectarWiFi() {
+  Serial.print("Conectando a WiFi");
+  WiFi.mode(WIFI_STA);
+  WiFi.begin(WIFI_SSID, WIFI_PASS);
+  while (WiFi.status() != WL_CONNECTED) {
+    delay(500);
+    Serial.print(".");
+  }
+  Serial.println(" conectado");
+}
+
+void conectarMQTT() {
+  while (!client.connected()) {
+    Serial.print("Conectando a ThingsBoard...");
+    String clientId = "esp32-invernadero-" + String(random(0xffff), HEX);
+    // En ThingsBoard el token va como usuario y la contraseña va vacía
+    if (client.connect(clientId.c_str(), TOKEN, "")) {
+      Serial.println(" conectado");
+      client.subscribe(TOPIC_RPC);
+    } else {
+      Serial.print(" fallo, codigo=");
+      Serial.print(client.state());
+      Serial.println(" reintento en 3 s");
+      delay(3000);
+    }
+  }
+}
+
+void setup() {
+  Serial.begin(115200);
+  dht.begin();
+  pinMode(PIN_LED, OUTPUT);
+  digitalWrite(PIN_LED, LOW);
+
+  conectarWiFi();
+  client.setServer(MQTT_SERVER, MQTT_PORT);
+  client.setCallback(callback);
+  Serial.println("Invernadero iniciado");
+}
+
+void loop() {
+  if (!client.connected()) {
+    conectarMQTT();
+  }
+  client.loop();
+
+  if (millis() - ultimaLectura >= INTERVALO) {
+    ultimaLectura = millis();
+
+    float temp = dht.readTemperature();
+    float humSuelo = analogRead(PIN_SUELO) * 100.0 / 4095.0;
+
+    if (isnan(temp)) {
+      Serial.println("Error leyendo el DHT22");
+      return;
+    }
+
+    // JSON: {"temp":24.5,"hum_suelo":68.2}
+    char mensaje[80];
+    snprintf(mensaje, sizeof(mensaje),
+             "{\"temp\":%.1f,\"hum_suelo\":%.1f}", temp, humSuelo);
+
+    client.publish(TOPIC_TELEMETRIA, mensaje);
+    Serial.print("Publicado: ");
+    Serial.println(mensaje);
+  }
+}
